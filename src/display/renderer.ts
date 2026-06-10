@@ -73,8 +73,9 @@ const RENDER_DELAY_MAX_MS = 4500;
 const CORR_TAU_MS = 350;
 /** Offscreen sky layer refresh cadence, ms (carries the star twinkle). */
 const SKY_LAYER_MS = 150;
-/** Altitude quantum for the glyph sprite cache, ft. */
-const ALT_BUCKET_FT = 1500;
+/** Altitude quantum for the glyph sprite cache, ft. Small enough that a
+ *  climbing plane's color steps are imperceptible. */
+const ALT_BUCKET_FT = 750;
 
 /** Characteristic tints for the naked-eye planets, as "r,g,b". */
 const PLANET_COLORS: Record<string, string> = {
@@ -511,8 +512,10 @@ export class Renderer {
         this.tracks.delete(hex);
         continue;
       }
-      // Trim history to the trail window (+ a little headroom for interp).
-      const keep = Math.max(cfg.trailSeconds, 6) * 1000 + 4000;
+      // Trim history to the trail window, with headroom for the adaptive
+      // render delay plus a sparse fix gap — trimming a fix the interpolator
+      // still needs would freeze the plane at its newest fix for a beat.
+      const keep = Math.max(cfg.trailSeconds, 6) * 1000 + RENDER_DELAY_MAX_MS + 5000;
       while (tr.history.length > 2 && now - tr.history[0].t > keep) tr.history.shift();
 
       // Fade in on spawn, fade out as it goes stale.

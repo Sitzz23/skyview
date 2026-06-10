@@ -84,11 +84,21 @@ export class RouteEnricher {
     } catch {
       // first run, no cache yet
     }
-    // Persist periodically rather than on every write.
-    this.flushTimer = setInterval(() => this.flush(), 15_000);
+    // Persist periodically rather than on every write — and during idle time,
+    // so the JSON stringify of a large cache never lands inside a frame.
+    this.flushTimer = setInterval(() => this.idleFlush(), 15_000);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) this.flush();
     });
+  }
+
+  private idleFlush(): void {
+    if (!this.dirty) return;
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(() => this.flush(), { timeout: 5000 });
+    } else {
+      this.flush();
+    }
   }
 
   dispose(): void {

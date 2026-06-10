@@ -83,10 +83,3 @@ Right-click a plane → full flight details. Left-click the sky to dismiss.
 - [Nominatim](https://nominatim.openstreetmap.org) — location search
 
 Be a good citizen: these are free community services.
-
-## Credits
-
-Rendering, glyph art, projection math, and the celestial layer are adapted
-from [Skylight](https://github.com/cpaczek/skylight) by Cameron Paczek,
-MIT-licensed. Skyview swaps its server + WebSocket pipeline for an in-browser
-poller and localStorage persistence.

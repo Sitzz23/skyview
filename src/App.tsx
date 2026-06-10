@@ -14,6 +14,7 @@ import { Poller, type SourceStatus } from "./lib/poller";
 import { Renderer } from "./display/renderer";
 import { SettingsPanel } from "./ui/SettingsPanel";
 import { FlightPopover } from "./ui/FlightPopover";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 
 const THEMES: Theme[] = ["ambient", "telemetry", "focus"];
 /** Hide the floating chrome after this long without pointer activity. */
@@ -268,6 +269,7 @@ export default function App() {
 
   return (
     <div className="app-root">
+      <SpeedInsights />
       <canvas ref={canvasRef} className="display-canvas" />
 
       <div className={chromeClass}>

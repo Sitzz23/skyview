@@ -13,6 +13,7 @@ import { geocode } from "./lib/geocode";
 import { Poller, type SourceStatus } from "./lib/poller";
 import { Renderer } from "./display/renderer";
 import { SettingsPanel } from "./ui/SettingsPanel";
+import { FlightPopover } from "./ui/FlightPopover";
 
 const THEMES: Theme[] = ["ambient", "telemetry", "focus"];
 /** Hide the floating chrome after this long without pointer activity. */
@@ -27,10 +28,12 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false);
   const [welcome, setWelcome] = useState(() => !hasSavedConfig());
   const [chromeVisible, setChromeVisible] = useState(true);
+  const [selected, setSelected] = useState<Aircraft | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const aircraftRef = useRef<Aircraft[]>([]);
+  const popoverRef = useRef<HTMLDivElement>(null);
 
   const patch = useCallback((p: Partial<Config>) => {
     setConfig((c) => {
@@ -52,12 +55,41 @@ export default function App() {
     });
   }, [patch]);
 
+  const closePanel = useCallback(() => setPanelOpen(false), []);
+
+  const closePopover = useCallback(() => {
+    setSelected(null);
+    rendererRef.current?.setSelected(null);
+  }, []);
+
   // Renderer: create once.
   useEffect(() => {
     if (!canvasRef.current) return;
     const r = new Renderer(canvasRef.current, () => configRef.current);
     rendererRef.current = r;
+    // Anchor the details popover to the selected plane every frame, bypassing
+    // React — a transform write is cheap; a render per frame is not.
+    r.onSelectedMove = (p) => {
+      const el = popoverRef.current;
+      if (!p) {
+        // Plane went stale or left the radius — dismiss.
+        setSelected(null);
+        r.setSelected(null);
+        return;
+      }
+      if (!el) return;
+      const margin = 10;
+      const pw = el.offsetWidth;
+      const ph = el.offsetHeight;
+      let x = p.x + 22;
+      let y = p.y - ph / 2;
+      if (x + pw > window.innerWidth - margin) x = p.x - pw - 22;
+      x = Math.max(margin, Math.min(x, window.innerWidth - pw - margin));
+      y = Math.max(margin, Math.min(y, window.innerHeight - ph - margin));
+      el.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    };
     r.start();
+    if (import.meta.env.DEV) (window as unknown as { __renderer?: Renderer }).__renderer = r;
     const onResize = () => r.resize();
     window.addEventListener("resize", onResize);
     return () => {
@@ -74,6 +106,10 @@ export default function App() {
       onSnapshot: (_now, aircraft) => {
         aircraftRef.current = aircraft;
         rendererRef.current?.update(aircraft);
+        // Keep the open popover's numbers live (1 Hz, only while open).
+        setSelected((prev) =>
+          prev ? (aircraft.find((a) => a.hex === prev.hex) ?? prev) : prev,
+        );
       },
       onStatus: setStatus,
     });
@@ -81,13 +117,45 @@ export default function App() {
     return () => poller.stop();
   }, []);
 
+  // Right-click a plane → details popover. Left-click on the sky dismisses it.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onContextMenu = (e: MouseEvent) => {
+      const r = rendererRef.current;
+      if (!r) return;
+      e.preventDefault();
+      const hex = r.hitTest(e.clientX, e.clientY);
+      if (hex) {
+        const ac = aircraftRef.current.find((a) => a.hex === hex);
+        if (ac) {
+          setSelected(ac);
+          r.setSelected(hex);
+          return;
+        }
+      }
+      setSelected(null);
+      r.setSelected(null);
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button === 0) closePopover();
+    };
+    canvas.addEventListener("contextmenu", onContextMenu);
+    canvas.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      canvas.removeEventListener("contextmenu", onContextMenu);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [closePopover]);
+
   // Moving the center invalidates all local-meter history — drop it so trails
   // don't streak across the world.
   useEffect(() => {
     rendererRef.current?.clearTracks();
-  }, [config.centerLat, config.centerLon]);
+    closePopover();
+  }, [config.centerLat, config.centerLon, closePopover]);
 
-  // Keyboard shortcuts (same as skylight's display).
+  // Keyboard shortcuts (same spirit as skylight's display).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement) return;
@@ -115,12 +183,13 @@ export default function App() {
           break;
         case "Escape":
           setPanelOpen(false);
+          closePopover();
           break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [patch]);
+  }, [patch, closePopover]);
 
   // Auto-hide the floating chrome when the pointer goes quiet (ambient mode).
   useEffect(() => {
@@ -228,13 +297,18 @@ export default function App() {
         </div>
       )}
 
+      {selected && (
+        <FlightPopover ref={popoverRef} ac={selected} cfg={config} onClose={closePopover} />
+      )}
+
       {welcome && (
         <div className="welcome-backdrop">
           <div className="welcome-card">
             <h1>Skyview</h1>
             <p>
               The aircraft moving through the sky around you, live. Pick where to
-              watch from — you can adjust the radius any time.
+              watch from — adjust the radius any time, and right-click any plane
+              for its full details.
             </p>
             <button className="welcome-primary" disabled={welcomeBusy} onClick={welcomeUseLocation}>
               Use my location
@@ -263,9 +337,9 @@ export default function App() {
 
       <SettingsPanel
         cfg={config}
-        status={status}
+        status={panelOpen ? status : null}
         open={panelOpen}
-        onClose={() => setPanelOpen(false)}
+        onClose={closePanel}
         set={patch}
         onReset={reset}
       />

@@ -157,6 +157,9 @@ export const DEFAULT_CONFIG: Config = {
   maxExtrapolationSec: 5,
   staleSec: 20,
   smoothing: 0.18,
+  // 0 = draw on every display refresh — the smoothest motion, and cheap now
+  // that glyphs are sprite-cached. A numeric cap can alias against the
+  // display's own refresh and judder, so it's opt-in for battery saving.
   maxFps: 0,
 
   theme: "ambient",
@@ -226,12 +229,16 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
   };
 }
 
-const STORAGE_KEY = "skyview.config.v1";
+const STORAGE_KEY = "skyview.config.v2";
+const LEGACY_KEYS = ["skyview.config.v1"];
 
 /** True once the user has been through the welcome card (a config was saved). */
 export function hasSavedConfig(): boolean {
   try {
-    return localStorage.getItem(STORAGE_KEY) != null;
+    return (
+      localStorage.getItem(STORAGE_KEY) != null ||
+      LEGACY_KEYS.some((k) => localStorage.getItem(k) != null)
+    );
   } catch {
     return false;
   }
@@ -240,8 +247,21 @@ export function hasSavedConfig(): boolean {
 export function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_CONFIG;
-    return mergeConfig(DEFAULT_CONFIG, JSON.parse(raw) as Partial<Config>);
+    if (raw) return mergeConfig(DEFAULT_CONFIG, JSON.parse(raw) as Partial<Config>);
+    // v1 → v2 migration: v1 briefly shipped with maxFps 60 as the default,
+    // which judders against 60 Hz displays — drop the field so the new
+    // default (uncapped) applies; keep everything else the user chose.
+    for (const key of LEGACY_KEYS) {
+      const legacy = localStorage.getItem(key);
+      if (!legacy) continue;
+      const parsed = JSON.parse(legacy) as Partial<Config>;
+      delete parsed.maxFps;
+      const cfg = mergeConfig(DEFAULT_CONFIG, parsed);
+      saveConfig(cfg);
+      localStorage.removeItem(key);
+      return cfg;
+    }
+    return DEFAULT_CONFIG;
   } catch {
     return DEFAULT_CONFIG;
   }

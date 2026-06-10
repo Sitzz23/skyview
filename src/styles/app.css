@@ -149,6 +149,93 @@ body {
   background: #e0533d;
 }
 
+/* --- flight details popover (right-click a plane) --- */
+.flight-popover {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: min(320px, calc(100vw - 24px));
+  background: rgba(14, 17, 23, 0.92);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px 16px 12px;
+  z-index: 25;
+  will-change: transform;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.pop-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.pop-title {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  color: #f5f7ff;
+}
+.pop-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.pop-close {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.pop-close:hover {
+  color: var(--text);
+}
+.pop-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.pop-field {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+.pop-key {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+.pop-val {
+  font-family: var(--mono);
+  color: var(--text);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.pop-val.warn {
+  color: var(--bad);
+  font-weight: 600;
+}
+.pop-links {
+  display: flex;
+  gap: 14px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.pop-links a {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.pop-links a:hover {
+  text-decoration: underline;
+}
+
 /* --- welcome card (first run) --- */
 .welcome-backdrop {
   position: fixed;

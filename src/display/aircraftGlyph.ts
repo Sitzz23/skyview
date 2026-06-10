@@ -70,18 +70,18 @@ type RGB = [number, number, number];
 const col = (c: RGB, a: number) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
 
 /**
- * Draw a glyph in local space (already translated to position and rotated so
- * "up" / -y is the direction of travel). Caller draws the halo; we draw the
- * glowing silhouette, engines/props/rotors, and bright core.
+ * Draw the STATIC part of a glyph in local space (already translated to
+ * position and rotated so "up" / -y is the direction of travel): the glowing
+ * silhouette with its shadow bloom, engines, and bright core. This is the
+ * expensive part (shadowBlur), so the renderer pre-renders it into a sprite
+ * cache; the spinning props/rotors are drawn live by `drawGlyphProps`.
  */
-export function drawAircraftGlyph(
+export function drawGlyphBody(
   ctx: CanvasRenderingContext2D,
   kind: GlyphKind,
   s: number,
   color: RGB,
   alpha: number,
-  t: number,
-  seed: number,
 ): void {
   ctx.shadowColor = col(color, 0.85 * alpha);
   ctx.shadowBlur = s * 0.7;
@@ -102,25 +102,17 @@ export function drawAircraftGlyph(
       jetBody(ctx, s, { fw: 0.2, nose: -1.0, tail: 0.96, span: 1.04, tipY: 0.34, straight: true });
       ctx.fill();
       ctx.shadowBlur = 0;
-      // Props in place of nacelles, spinning.
-      propDisc(ctx, -0.5 * s, 0.18 * s, 0.26 * s, color, alpha, t * 9 + seed);
-      propDisc(ctx, 0.5 * s, 0.18 * s, 0.26 * s, color, alpha, -t * 9 + seed, true);
       core(ctx, s, alpha, 0.09);
       break;
     case "light":
       lightBody(ctx, s);
       ctx.fill();
       ctx.shadowBlur = 0;
-      // Single nose prop, spinning.
-      propDisc(ctx, 0, -0.95 * s, 0.34 * s, color, alpha, t * 11 + seed);
       break;
     case "helicopter":
       heliBody(ctx, s);
       ctx.fill();
       ctx.shadowBlur = 0;
-      // Tail rotor (small, fast) then main rotor (large, over the body).
-      propDisc(ctx, 0.04 * s, 1.18 * s, 0.22 * s, color, alpha, t * 16 + seed, false, 2);
-      mainRotor(ctx, s, color, alpha, t * 6 + seed);
       break;
     case "airliner":
     default:
@@ -129,6 +121,50 @@ export function drawAircraftGlyph(
       core(ctx, s, alpha, 0.1);
       break;
   }
+}
+
+/** Draw the ANIMATED part of a glyph: spinning props/rotors. No shadowBlur. */
+export function drawGlyphProps(
+  ctx: CanvasRenderingContext2D,
+  kind: GlyphKind,
+  s: number,
+  color: RGB,
+  alpha: number,
+  t: number,
+  seed: number,
+): void {
+  switch (kind) {
+    case "turboprop":
+      // Props in place of nacelles, spinning.
+      propDisc(ctx, -0.5 * s, 0.18 * s, 0.26 * s, color, alpha, t * 9 + seed);
+      propDisc(ctx, 0.5 * s, 0.18 * s, 0.26 * s, color, alpha, -t * 9 + seed, true);
+      break;
+    case "light":
+      // Single nose prop, spinning.
+      propDisc(ctx, 0, -0.95 * s, 0.34 * s, color, alpha, t * 11 + seed);
+      break;
+    case "helicopter":
+      // Tail rotor (small, fast) then main rotor (large, over the body).
+      propDisc(ctx, 0.04 * s, 1.18 * s, 0.22 * s, color, alpha, t * 16 + seed, false, 2);
+      mainRotor(ctx, s, color, alpha, t * 6 + seed);
+      break;
+    default:
+      break; // jets have no moving parts
+  }
+}
+
+/** Full glyph in one call (body + animated parts), for uncached drawing. */
+export function drawAircraftGlyph(
+  ctx: CanvasRenderingContext2D,
+  kind: GlyphKind,
+  s: number,
+  color: RGB,
+  alpha: number,
+  t: number,
+  seed: number,
+): void {
+  drawGlyphBody(ctx, kind, s, color, alpha);
+  drawGlyphProps(ctx, kind, s, color, alpha, t, seed);
 }
 
 interface JetOpts {

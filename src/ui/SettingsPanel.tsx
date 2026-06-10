@@ -1,11 +1,10 @@
 // The settings drawer — skylight's phone control panel, folded into the page.
 // Adapted from skylight (github.com/cpaczek/skylight, MIT).
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { Config, LocationProfile, ShowFields } from "../lib/config";
 import { formatLatLon } from "../lib/geo";
 import { geocode } from "../lib/geocode";
-import { nextISSPass, type Tle } from "../lib/celestial";
 import { getTles } from "../lib/tle";
 import type { SourceStatus } from "../lib/poller";
 import { ColorRow, Row, Section, Segmented, Slider, TextInput, Toggle } from "./components";
@@ -33,7 +32,7 @@ const FIELD_LABELS: Record<keyof ShowFields, string> = {
   registration: "Registration",
 };
 
-export function SettingsPanel({
+export const SettingsPanel = memo(function SettingsPanel({
   cfg,
   status,
   open,
@@ -51,20 +50,22 @@ export function SettingsPanel({
   const [geoBusy, setGeoBusy] = useState(false);
   const [geoErr, setGeoErr] = useState<string | null>(null);
 
-  // ISS pass finder (for the Sky section).
-  const [tles, setTles] = useState<Tle[]>([]);
+  // ISS pass finder (for the Sky section). The orbital math lives in the
+  // lazy-loaded celestial chunk — pull it in only when the panel opens.
+  const [nextPass, setNextPass] = useState<number | null>(null);
   useEffect(() => {
     if (!open) return;
     let on = true;
-    getTles().then((t) => on && setTles(t));
+    void (async () => {
+      const [tles, celestial] = await Promise.all([getTles(), import("../lib/celestial")]);
+      if (on && tles.length) {
+        setNextPass(celestial.nextISSPass(Date.now(), cfg.centerLat, cfg.centerLon, tles));
+      }
+    })();
     return () => {
       on = false;
     };
-  }, [open]);
-  const nextPass = useMemo(
-    () => (tles.length ? nextISSPass(Date.now(), cfg.centerLat, cfg.centerLon, tles) : null),
-    [tles, cfg.centerLat, cfg.centerLon],
-  );
+  }, [open, cfg.centerLat, cfg.centerLon]);
 
   const setField = (k: keyof ShowFields, v: boolean) =>
     set({ showFields: { ...cfg.showFields, [k]: v } });
@@ -428,4 +429,4 @@ export function SettingsPanel({
       </aside>
     </>
   );
-}
+});

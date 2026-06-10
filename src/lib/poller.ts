@@ -10,8 +10,13 @@ import { RouteEnricher } from "./enrich";
 
 const API_TEMPLATE = "https://api.airplanes.live/v2/point/{lat}/{lon}/{r}";
 const NM_PER_MILE = 0.868976;
-/** airplanes.live asks for at most ~1 request/second. */
-const POLL_MS = 1000;
+/**
+ * airplanes.live allows ~1 request/second. Polling at exactly 1000 ms sits on
+ * that limit and timing jitter trips 429s — each one costs seconds of data
+ * (backoff) and forces the renderer to extrapolate. 10% margin keeps polls
+ * reliably under the limit; the adaptive render delay absorbs the cadence.
+ */
+const POLL_MS = 1100;
 /** Back off up to this much after consecutive failures (e.g. rate limited). */
 const MAX_BACKOFF_MS = 15_000;
 
@@ -109,10 +114,17 @@ export class Poller {
     this.enricher.dispose();
   }
 
-  private schedule(): void {
+  /**
+   * Keep a FIXED cadence: aim the next tick POLL_MS from this tick's START,
+   * not from its completion. Otherwise network round-trip time silently
+   * stretches the fix interval (1 s + RTT), the renderer outruns its data,
+   * and aircraft rubber-band between extrapolation and correction.
+   */
+  private schedule(startedAt: number): void {
     if (!this.running) return;
-    const backoff = this.fails ? Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** this.fails) : POLL_MS;
-    this.timer = setTimeout(() => void this.tick(), backoff);
+    const base = this.fails ? Math.min(MAX_BACKOFF_MS, POLL_MS * 2 ** this.fails) : POLL_MS;
+    const elapsed = Date.now() - startedAt;
+    this.timer = setTimeout(() => void this.tick(), Math.max(150, base - elapsed));
   }
 
   private buildUrl(): string {
@@ -128,7 +140,7 @@ export class Poller {
     // Don't burn API quota while the tab is hidden — the renderer is paused
     // anyway. Check again shortly; resume polling the moment we're visible.
     if (document.hidden) {
-      this.timer = setTimeout(() => void this.tick(), 2000);
+      this.timer = setTimeout(() => void this.tick(), 1000);
       return;
     }
     const now = Date.now();
@@ -157,7 +169,7 @@ export class Poller {
       };
       this.o.onStatus(this.status);
     }
-    this.schedule();
+    this.schedule(now);
   }
 
   private enrich(ac: Aircraft, now: number): void {

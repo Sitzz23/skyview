@@ -16,9 +16,13 @@ public APIs directly.
   rings and compass
 - Type-aware silhouettes: widebodies read bigger, helicopters spin their
   rotors, turboprops and Cessnas spin their props
-- **Smooth 60 fps motion** interpolated between ~1 Hz fixes (rendered ~1.15 s
-  in the past — interpolation between known points, never jittery
-  extrapolation)
+- **Smooth motion at display refresh rate**, interpolated between real fixes.
+  The renderer draws the world a couple of seconds in the past and *adapts*
+  that delay to the measured fix cadence (network RTT, receiver coverage,
+  dropped polls), so it almost always interpolates between two known points.
+  When a correction is unavoidable, it's blended in over ~350 ms — planes
+  glide, they never snap. Positions on screen run ~2–4 s behind reality by
+  design; that's the price of jitter-free ambient motion.
 - **"Window to elsewhere"**: each routed flight shows origin → destination,
   the destination's local time, distance to go, and a faint great-circle arc
 - Celestial layer at true positions: sun, moon (with phase), bright stars +
@@ -27,8 +31,23 @@ public APIs directly.
 - Two projections: **Map** (overhead ground plan) and **Sky** (look-up dome —
   zenith at center, horizon at the edge, motion matching what you'd see lying
   outside)
+- **Right-click any plane** for a details popover that follows it: airline,
+  type, registration, squawk, altitudes, vertical rate, speed, track, position,
+  distance/bearing from you, route with cities, distance-to-go and destination
+  local time, plus airplanes.live / FlightAware links
 - Themes (ambient / telemetry / focus), live-tunable palette, filters, label
   density — all persisted to localStorage
+
+## Performance
+
+Built to idle on anything: glyph bodies (the shadow-bloom part) are
+pre-rendered into a sprite cache so each plane is one rotated `drawImage` per
+frame; the celestial layer renders to an offscreen canvas refreshed every
+~150 ms; rings/compass/runways re-render only when the view changes; the
+astronomy/orbital libraries load lazily in a separate chunk; label measurement
+is memoized and invisible trail segments are skipped. Measured: ~0.8 ms/frame
+with a handful of aircraft, ~1.9 ms/frame with 150 — ≈11% of a 60 fps budget.
+Polling pauses while the tab is hidden and backs off on API errors.
 
 ## Run it
 
@@ -50,6 +69,9 @@ Netlify, Cloudflare Pages).
 | `p` | toggle map / sky projection |
 | `t` | cycle theme |
 | `h` | status HUD |
+| `Esc` | close drawer / popover |
+
+Right-click a plane → full flight details. Left-click the sky to dismiss.
 
 ## Data sources
 

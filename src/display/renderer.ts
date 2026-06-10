@@ -16,6 +16,18 @@
 //
 // Visual language: pure black, luminous altitude-graded glyphs, comet trails that
 // taper and fade, and restrained typography that fades in only for the nearest few.
+//
+// Performance architecture (the website runs on whatever the visitor has):
+//  - The celestial layer (stars/sun/moon/planets/sats) renders into an offscreen
+//    canvas refreshed every ~150 ms, then blitted — not redrawn per frame.
+//  - Range rings / compass / runways render into a second offscreen canvas,
+//    refreshed only when view geometry or palette changes.
+//  - Glyph bodies + halos (the shadowBlur-heavy part) are pre-rendered into a
+//    sprite cache keyed by kind/color/size; per frame they're a single rotated
+//    drawImage. Spinning props/rotors are drawn live (cheap strokes).
+//  - astronomy-engine + satellite.js load lazily in a separate chunk, so first
+//    paint doesn't wait on them.
+//  - Label text measurement is memoized; invisible trail segments are skipped.
 
 import type { Aircraft } from "../lib/aircraft";
 import type { Config } from "../lib/config";
@@ -41,12 +53,28 @@ import {
 import { formatSpeed } from "../lib/format";
 import { getTles } from "../lib/tle";
 import { AIRPORTS } from "./airports";
-import { classifyGlyph, drawAircraftGlyph, GLYPH_SCALE } from "./aircraftGlyph";
-import { computeSky, type Sky, type Tle } from "../lib/celestial";
+import { classifyGlyph, drawGlyphBody, drawGlyphProps, GLYPH_SCALE } from "./aircraftGlyph";
+import type { Sky, Tle } from "../lib/celestial";
 import { ASTERISMS } from "../lib/stars";
 
-/** How far in the past we render, ms. Just over the ~1 Hz fix interval. */
+type CelestialModule = typeof import("../lib/celestial");
+
+/**
+ * Minimum render delay, ms. The renderer draws the world this far in the past
+ * and ADAPTS upward to the measured fix cadence (network RTT, aggregator
+ * update rate, dropped polls), so render time almost always falls BETWEEN two
+ * known fixes — interpolation, never the extrapolate-then-snap cycle. A couple
+ * seconds of latency is invisible in an ambient piece; jitter is not.
+ */
 const RENDER_DELAY_MS = 1150;
+/** Never delay more than this, ms. */
+const RENDER_DELAY_MAX_MS = 4500;
+/** Time constant for blending away extrapolation corrections, ms. */
+const CORR_TAU_MS = 350;
+/** Offscreen sky layer refresh cadence, ms (carries the star twinkle). */
+const SKY_LAYER_MS = 150;
+/** Altitude quantum for the glyph sprite cache, ft. */
+const ALT_BUCKET_FT = 1500;
 
 /** Characteristic tints for the naked-eye planets, as "r,g,b". */
 const PLANET_COLORS: Record<string, string> = {
@@ -73,9 +101,15 @@ interface Track {
   hasPos: boolean;
   /** Smoothed appearance alpha (fade in on spawn, out when stale). */
   life: number;
+  /** Residual extrapolation error (meters), blended away over CORR_TAU_MS. */
+  corrE: number;
+  corrN: number;
+  /** When the correction was set (perf clock); 0 = none active. */
+  corrT: number;
 }
 
 type ProjOpts = Parameters<typeof project>[1];
+type Ctx2D = CanvasRenderingContext2D;
 
 // Altitude colour ramp — warm low, cool high. Tuned to glow on black.
 const ALT_STOPS: [number, [number, number, number]][] = [
@@ -116,12 +150,13 @@ interface Visible {
   rangeMi: number;
   alpha: number;
   color: [number, number, number];
+  colorKey: string;
   emergency: boolean;
   sizeScale: number;
 }
 
 export class Renderer {
-  private ctx: CanvasRenderingContext2D;
+  private ctx: Ctx2D;
   private tracks = new Map<string, Track>();
   private raf = 0;
   private dpr = 1;
@@ -135,11 +170,40 @@ export class Renderer {
   private frameT = 0;
   private tleTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Adaptive motion-model state.
+  /** Current render delay, ms — ramped gently toward the measured target. */
+  private renderDelayMs = RENDER_DELAY_MS + 500;
+  /** EMA of the interval between appended fixes, ms. */
+  private gapEma = 1000;
+  /** EMA of the absolute deviation of that interval, ms. */
+  private gapDev = 200;
+  /** When the first track appeared (perf clock) — fast-adapt window. */
+  private firstTrackAt = 0;
+
   // Sky layer state.
+  private celestial: CelestialModule | null = null;
   private tles: Tle[] = [];
   private sky: Sky = { stars: [], sats: [], planets: [] };
   private skyComputedAt = 0;
   private skyOffsetUsed = NaN;
+
+  // Offscreen layers + caches.
+  private skyLayer = document.createElement("canvas");
+  private skyLayerCtx: Ctx2D;
+  private skyLayerKey = "";
+  private skyLayerAt = 0;
+  private ovlLayer = document.createElement("canvas");
+  private ovlLayerCtx: Ctx2D;
+  private ovlLayerKey = "";
+  private spriteCache = new Map<string, HTMLCanvasElement>();
+  private textWidthCache = new Map<string, number>();
+
+  // Selection (right-click details).
+  private selectedHex: string | null = null;
+  /** Called each frame with the selected aircraft's screen point (null = lost). */
+  onSelectedMove: ((p: Point | null) => void) | null = null;
+  /** Screen positions of the last drawn frame, for hit-testing. */
+  private lastScreen: { hex: string; x: number; y: number; r: number }[] = [];
 
   constructor(
     private canvas: HTMLCanvasElement,
@@ -148,10 +212,17 @@ export class Renderer {
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) throw new Error("2D canvas context unavailable");
     this.ctx = ctx;
+    this.skyLayerCtx = this.skyLayer.getContext("2d")!;
+    this.ovlLayerCtx = this.ovlLayer.getContext("2d")!;
     this.resize();
   }
 
   start(): void {
+    // The astronomy/satellite math lives in its own chunk — load it in the
+    // background so aircraft appear immediately on first visit.
+    void import("../lib/celestial").then((m) => {
+      this.celestial = m;
+    });
     void this.fetchTles();
     this.tleTimer = setInterval(() => void this.fetchTles(), 3600_000);
     const loop = (now: number) => {
@@ -164,7 +235,10 @@ export class Renderer {
       if (fps > 0) {
         const interval = 1000 / fps;
         if (this.nextFrameDue === 0) this.nextFrameDue = now;
-        if (now < this.nextFrameDue) return; // not due yet — skip this tick
+        // Small tolerance: rAF timestamps land a hair early/late around the
+        // due time; without it a 60-cap on a 60 Hz display aliases and drops
+        // a frame every few seconds (16 ms → 33 ms judder).
+        if (now < this.nextFrameDue - 1.5) return; // not due yet — skip this tick
         this.nextFrameDue += interval;
         // If we've fallen more than a frame behind (e.g. tab was backgrounded
         // or a draw stalled), resync to avoid a burst of catch-up frames.
@@ -190,9 +264,23 @@ export class Renderer {
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.w = this.canvas.clientWidth;
     this.h = this.canvas.clientHeight;
-    this.canvas.width = Math.round(this.w * this.dpr);
-    this.canvas.height = Math.round(this.h * this.dpr);
+    const dw = Math.round(this.w * this.dpr);
+    const dh = Math.round(this.h * this.dpr);
+    this.canvas.width = dw;
+    this.canvas.height = dh;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    for (const [layer, lctx] of [
+      [this.skyLayer, this.skyLayerCtx],
+      [this.ovlLayer, this.ovlLayerCtx],
+    ] as [HTMLCanvasElement, Ctx2D][]) {
+      layer.width = dw;
+      layer.height = dh;
+      lctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    }
+    // Force layer + sprite rebuilds at the new scale.
+    this.skyLayerKey = "";
+    this.ovlLayerKey = "";
+    this.spriteCache.clear();
   }
 
   /** Feed a fresh snapshot. Stamps each fix with local arrival time. */
@@ -208,8 +296,12 @@ export class Renderer {
       const altFt = ac.altBaro ?? ac.altGeom ?? 0;
       let tr = this.tracks.get(ac.hex);
       if (!tr) {
-        tr = { ac, history: [], firstSeen: now, lastSeen: now, hasPos, life: 0 };
+        tr = {
+          ac, history: [], firstSeen: now, lastSeen: now, hasPos, life: 0,
+          corrE: 0, corrN: 0, corrT: 0,
+        };
         this.tracks.set(ac.hex, tr);
+        if (!this.firstTrackAt) this.firstTrackAt = now;
       }
       tr.ac = ac;
       tr.lastSeen = now;
@@ -223,7 +315,41 @@ export class Renderer {
           last.m.north !== m.north ||
           last.altFt !== altFt
         ) {
-          tr.history.push({ t: now, m, altFt, track: ac.track, gs: ac.gs });
+          const fresh: Sample = { t: now, m, altFt, track: ac.track, gs: ac.gs };
+          if (last) {
+            // Feed the adaptive render delay with the real fix cadence.
+            const gap = now - last.t;
+            if (gap < 15000) {
+              this.gapEma += (gap - this.gapEma) * 0.08;
+              this.gapDev += (Math.abs(gap - this.gapEma) - this.gapDev) * 0.08;
+            }
+            // If we were drawing PAST the last fix (extrapolating), the new
+            // fix moves the drawn position discontinuously. Measure that step
+            // and carry it as a correction that decays over CORR_TAU_MS, so
+            // the plane glides onto the corrected path instead of snapping.
+            const tt = now - this.renderDelayMs;
+            if (this.prevFrame && tt > last.t) {
+              const before = this.sampleAt(tr, tt, cfg);
+              tr.history.push(fresh);
+              const after = this.sampleAt(tr, tt, cfg);
+              if (before && after) {
+                const k = tr.corrT ? Math.exp(-(now - tr.corrT) / CORR_TAU_MS) : 0;
+                const dE = tr.corrE * k + (before.m.east - after.m.east);
+                const dN = tr.corrN * k + (before.m.north - after.m.north);
+                const dist = Math.hypot(dE, dN);
+                // Ignore sub-meter noise; don't smear genuine teleports.
+                if (dist > 1 && dist < 3000) {
+                  tr.corrE = dE;
+                  tr.corrN = dN;
+                  tr.corrT = now;
+                } else {
+                  tr.corrT = 0;
+                }
+              }
+              continue;
+            }
+          }
+          tr.history.push(fresh);
         }
       }
     }
@@ -232,6 +358,27 @@ export class Renderer {
   /** Drop all aircraft history — call when the center point moves. */
   clearTracks(): void {
     this.tracks.clear();
+    this.firstTrackAt = 0;
+  }
+
+  // --- selection / hit-testing (right-click details) ---
+
+  setSelected(hex: string | null): void {
+    this.selectedHex = hex;
+  }
+
+  /** Nearest aircraft within its hit radius of a screen point, else null. */
+  hitTest(x: number, y: number): string | null {
+    let best: string | null = null;
+    let bestD = Infinity;
+    for (const s of this.lastScreen) {
+      const d = Math.hypot(s.x - x, s.y - y);
+      if (d <= s.r && d < bestD) {
+        bestD = d;
+        best = s.hex;
+      }
+    }
+    return best;
   }
 
   private passesFilter(ac: Aircraft, cfg: Config): boolean {
@@ -300,6 +447,20 @@ export class Renderer {
     );
   }
 
+  /** Quantized glyph color + a stable key for the sprite cache. */
+  private colorFor(
+    cfg: Config,
+    altFt: number,
+    emergency: boolean,
+  ): { rgb: [number, number, number]; key: string } {
+    if (emergency) return { rgb: hexToRgb(cfg.palette.warn), key: "w" + cfg.palette.warn };
+    if (cfg.altitudeColor) {
+      const bucket = Math.max(0, Math.round(altFt / ALT_BUCKET_FT));
+      return { rgb: altRamp(bucket * ALT_BUCKET_FT), key: "a" + bucket };
+    }
+    return { rgb: hexToRgb(cfg.palette.glyph), key: "p" + cfg.palette.glyph };
+  }
+
   private draw(): void {
     const cfg = this.getConfig();
     const ctx = this.ctx;
@@ -326,11 +487,22 @@ export class Renderer {
     };
 
     this.updateSky(cfg, now);
-    this.drawSky(cfg, proj);
-    this.drawOverlays(cfg, proj);
-    if (cfg.showAirport) this.drawAirport(cfg, proj);
+    this.blitSkyLayer(cfg, proj, now);
+    this.blitOverlayLayer(cfg, proj);
 
-    const tt = now - RENDER_DELAY_MS;
+    // Adapt the render delay to the measured fix cadence: stay past the EMA
+    // plus headroom for variance so render time falls between known fixes.
+    // Ramp gently — a fast ramp would itself read as planes speeding up or
+    // slowing down — except right after (re)start, when nothing is on screen.
+    const targetDelay = Math.min(
+      RENDER_DELAY_MAX_MS,
+      Math.max(RENDER_DELAY_MS, this.gapEma + 2 * this.gapDev + 300),
+    );
+    const fastAdapt = this.tracks.size === 0 || now - this.firstTrackAt < 8000;
+    const maxStep = (fastAdapt ? 600 : 60) * frameDt;
+    this.renderDelayMs += Math.max(-maxStep, Math.min(maxStep, targetDelay - this.renderDelayMs));
+
+    const tt = now - this.renderDelayMs;
     const visible: Visible[] = [];
 
     for (const [hex, tr] of this.tracks) {
@@ -348,8 +520,22 @@ export class Renderer {
       tr.life += (target - tr.life) * Math.min(1, frameDt * 3.5);
 
       if (!tr.hasPos) continue;
-      const sample = this.sampleAt(tr, tt, cfg);
+      let sample = this.sampleAt(tr, tt, cfg);
       if (!sample) continue;
+
+      // Apply the decaying extrapolation correction: the plane glides onto
+      // the corrected path over ~CORR_TAU_MS instead of snapping to it.
+      if (tr.corrT) {
+        const k = Math.exp(-(now - tr.corrT) / CORR_TAU_MS);
+        if (k < 0.02) {
+          tr.corrT = 0;
+        } else {
+          sample = {
+            m: { east: sample.m.east + tr.corrE * k, north: sample.m.north + tr.corrN * k },
+            altFt: sample.altFt,
+          };
+        }
+      }
 
       const rangeMi = metersToMiles(rangeMeters(sample.m));
       if (rangeMi > cfg.radiusMiles * 1.08) continue;
@@ -365,13 +551,12 @@ export class Renderer {
           ? clamp01(sky.elev / 6) * clamp01((cfg.radiusMiles - rangeMi) / (cfg.radiusMiles * 0.14))
           : clamp01((cfg.radiusMiles - rangeMi) / (cfg.radiusMiles * 0.14));
       const alpha = clamp01(edgeFade) * tr.life * cfg.brightness;
-      const alt = sample.altFt;
-      const color = cfg.altitudeColor ? altRamp(alt) : hexToRgb(cfg.palette.glyph);
       const emergency = cfg.highlightEmergency && !!tr.ac.squawk && EMERGENCY_SQUAWKS.has(tr.ac.squawk);
+      const { rgb: color, key: colorKey } = this.colorFor(cfg, sample.altFt, emergency);
       const sizeScale =
         cfg.projectionMode === "sky" && sky ? skyGlyphScale(sky.slantM) : 1;
 
-      visible.push({ tr, sample, sky, p, heading, rangeMi, alpha, color, emergency, sizeScale });
+      visible.push({ tr, sample, sky, p, heading, rangeMi, alpha, color, colorKey, emergency, sizeScale });
     }
 
     // Nearest last so it paints on top.
@@ -387,18 +572,48 @@ export class Renderer {
     this.drawLabels(cfg, byNear);
 
     if (cfg.theme === "focus" && byNear.length) this.drawDetailPanel(cfg, byNear[0]);
+
+    // Hit-test map + selection ring/anchor for the details popover.
+    this.lastScreen = visible.map((v) => ({
+      hex: v.tr.ac.hex,
+      x: v.p.x,
+      y: v.p.y,
+      r: Math.max(20, cfg.glyphSizePx * GLYPH_SCALE[classifyGlyph(v.tr.ac)] * v.sizeScale * 1.7),
+    }));
+    if (this.selectedHex) {
+      const sel = visible.find((v) => v.tr.ac.hex === this.selectedHex);
+      if (sel) {
+        this.drawSelectionRing(cfg, sel);
+        this.onSelectedMove?.(sel.p);
+      } else {
+        this.onSelectedMove?.(null);
+      }
+    }
+  }
+
+  private drawSelectionRing(cfg: Config, v: Visible): void {
+    const ctx = this.ctx;
+    const kind = classifyGlyph(v.tr.ac);
+    const r = cfg.glyphSizePx * GLYPH_SCALE[kind] * v.sizeScale * 1.9 + 3;
+    const breath = 0.4 + 0.18 * Math.sin(this.frameT * 2.4);
+    ctx.save();
+    ctx.strokeStyle = rgba(hexToRgb(cfg.palette.accent), breath * cfg.brightness);
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(v.p.x, v.p.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
   }
 
   /**
    * Run `draw` with the canvas rotated by `labelRotationDeg` around an anchor,
    * so text reads upright from a rotated viewpoint without moving the field.
    */
-  private withLabelRotation(cfg: Config, ax: number, ay: number, draw: () => void): void {
+  private withLabelRotation(ctx: Ctx2D, cfg: Config, ax: number, ay: number, draw: () => void): void {
     if (!cfg.labelRotationDeg) {
       draw();
       return;
     }
-    const ctx = this.ctx;
     ctx.save();
     ctx.translate(ax, ay);
     ctx.rotate((cfg.labelRotationDeg * Math.PI) / 180);
@@ -427,9 +642,26 @@ export class Renderer {
     return 0;
   }
 
+  // --- offscreen layer: overlays (rings + compass + runways) ---
+  private blitOverlayLayer(cfg: Config, proj: ProjOpts): void {
+    const key = [
+      this.w, this.h, this.dpr, cfg.radiusMiles, cfg.rotationDeg, cfg.mirrorX, cfg.mirrorY,
+      cfg.projectionMode, cfg.brightness, cfg.rangeRings, cfg.compass, cfg.showAirport,
+      cfg.labelRotationDeg, cfg.palette.grid, cfg.palette.text, cfg.fonts.mono, cfg.fonts.label,
+      cfg.centerLat, cfg.centerLon,
+    ].join("|");
+    if (key !== this.ovlLayerKey) {
+      this.ovlLayerKey = key;
+      const lctx = this.ovlLayerCtx;
+      lctx.clearRect(0, 0, this.w, this.h);
+      this.drawOverlays(lctx, cfg, proj);
+      if (cfg.showAirport) this.drawAirport(lctx, cfg, proj);
+    }
+    this.ctx.drawImage(this.ovlLayer, 0, 0, this.w, this.h);
+  }
+
   // --- overlays: whisper-quiet rings + compass ---
-  private drawOverlays(cfg: Config, proj: ProjOpts): void {
-    const ctx = this.ctx;
+  private drawOverlays(ctx: Ctx2D, cfg: Config, proj: ProjOpts): void {
     const cx = this.w / 2;
     const cy = this.h / 2;
     const hM = this.horizonM(cfg);
@@ -506,7 +738,7 @@ export class Renderer {
               },
               { ...proj, pxPerM: (Math.min(this.w, this.h) / 2) * 0.965 / 1e6 },
             );
-        this.withLabelRotation(cfg, p.x, p.y, () => ctx.fillText(label, p.x, p.y));
+        this.withLabelRotation(ctx, cfg, p.x, p.y, () => ctx.fillText(label, p.x, p.y));
       }
       try {
         ctx.letterSpacing = "0px";
@@ -518,8 +750,7 @@ export class Renderer {
   }
 
   // --- airport: runways at true geographic position ---
-  private drawAirport(cfg: Config, proj: ProjOpts): void {
-    const ctx = this.ctx;
+  private drawAirport(ctx: Ctx2D, cfg: Config, proj: ProjOpts): void {
     const rwyRgb: [number, number, number] = [150, 180, 220];
     for (const ap of AIRPORTS) {
       let cx = 0;
@@ -591,7 +822,7 @@ export class Renderer {
   private updateSky(cfg: Config, now: number): void {
     const want =
       cfg.showStars || cfg.showSun || cfg.showMoon || cfg.showSatellites || cfg.showPlanets;
-    if (!want) {
+    if (!want || !this.celestial) {
       this.sky = { stars: [], sats: [], planets: [] };
       return;
     }
@@ -599,7 +830,7 @@ export class Renderer {
     this.skyComputedAt = now;
     this.skyOffsetUsed = cfg.skyTimeOffsetMin;
     const date = new Date(Date.now() + cfg.skyTimeOffsetMin * 60000);
-    this.sky = computeSky(date, cfg.centerLat, cfg.centerLon, {
+    this.sky = this.celestial.computeSky(date, cfg.centerLat, cfg.centerLon, {
       sun: cfg.showSun,
       moon: cfg.showMoon,
       stars: cfg.showStars,
@@ -610,13 +841,35 @@ export class Renderer {
     });
   }
 
+  /** Redraw the offscreen sky layer when due or stale, then blit it. */
+  private blitSkyLayer(cfg: Config, proj: ProjOpts, now: number): void {
+    const want =
+      cfg.showStars || cfg.showSun || cfg.showMoon || cfg.showSatellites || cfg.showPlanets;
+    const key = !want
+      ? "off"
+      : [
+          this.w, this.h, this.dpr, cfg.radiusMiles, cfg.rotationDeg, cfg.mirrorX, cfg.mirrorY,
+          cfg.projectionMode, cfg.brightness, cfg.showStars, cfg.showSun, cfg.showMoon,
+          cfg.showSatellites, cfg.satelliteLabels, cfg.showPlanets, cfg.starMagLimit,
+          cfg.starLabelMagLimit, cfg.labelRotationDeg, cfg.fonts.label,
+        ].join("|");
+    const due = now - this.skyLayerAt >= SKY_LAYER_MS; // carries the twinkle
+    if (key !== this.skyLayerKey || (due && want)) {
+      this.skyLayerKey = key;
+      this.skyLayerAt = now;
+      const lctx = this.skyLayerCtx;
+      lctx.clearRect(0, 0, this.w, this.h);
+      if (want) this.drawSky(lctx, cfg, proj);
+    }
+    if (want) this.ctx.drawImage(this.skyLayer, 0, 0, this.w, this.h);
+  }
+
   /** Place an (azimuth, altitude) sky point on the field. Zenith=center, horizon=edge. */
   private projectSky(az: number, alt: number, cfg: Config, proj: ProjOpts): Point {
     return projectSkyPoint(az, alt, proj, this.horizonM(cfg));
   }
 
-  private drawSky(cfg: Config, proj: ProjOpts): void {
-    const ctx = this.ctx;
+  private drawSky(ctx: Ctx2D, cfg: Config, proj: ProjOpts): void {
     const b = cfg.brightness;
 
     // Asterism lines (faint) — need star screen points by id.
@@ -656,16 +909,16 @@ export class Renderer {
         }
         ctx.fill();
         ctx.shadowBlur = 0;
-        if (mag < cfg.starLabelMagLimit && s.name) this.skyLabel(p, s.name, cfg, 0.5 * b);
+        if (mag < cfg.starLabelMagLimit && s.name) this.skyLabel(ctx, p, s.name, cfg, 0.5 * b);
       }
     }
 
     if (cfg.showMoon && this.sky.moon && this.sky.moon.alt > -2) {
-      this.drawMoon(this.projectSky(this.sky.moon.az, this.sky.moon.alt, cfg, proj),
+      this.drawMoon(ctx, this.projectSky(this.sky.moon.az, this.sky.moon.alt, cfg, proj),
         this.sky.moon.illum ?? 1, this.sky.moon.waning ?? false, b);
     }
     if (cfg.showSun && this.sky.sun && this.sky.sun.alt > -2) {
-      this.drawSun(this.projectSky(this.sky.sun.az, this.sky.sun.alt, cfg, proj), b);
+      this.drawSun(ctx, this.projectSky(this.sky.sun.az, this.sky.sun.alt, cfg, proj), b);
     }
     if (cfg.showPlanets && this.sky.planets.length) {
       for (const pl of this.sky.planets) {
@@ -684,7 +937,7 @@ export class Renderer {
         ctx.fill();
         ctx.shadowBlur = 0;
         if (pl.name) {
-          this.skyLabel({ x: p.x + 6, y: p.y - 6 }, pl.name, cfg, 0.7 * b, `rgb(${col})`);
+          this.skyLabel(ctx, { x: p.x + 6, y: p.y - 6 }, pl.name, cfg, 0.7 * b, `rgb(${col})`);
         }
       }
     }
@@ -704,16 +957,15 @@ export class Renderer {
         ctx.fill();
         ctx.shadowBlur = 0;
         if (iss) {
-          this.skyLabel({ x: p.x + 6, y: p.y - 6 }, "ISS", cfg, 0.9 * b, "#8CFFD6");
+          this.skyLabel(ctx, { x: p.x + 6, y: p.y - 6 }, "ISS", cfg, 0.9 * b, "#8CFFD6");
         } else if (cfg.satelliteLabels && sat.name) {
-          this.skyLabel({ x: p.x + 5, y: p.y - 5 }, sat.name, cfg, 0.6 * b);
+          this.skyLabel(ctx, { x: p.x + 5, y: p.y - 5 }, sat.name, cfg, 0.6 * b);
         }
       }
     }
   }
 
-  private drawSun(p: Point, b: number): void {
-    const ctx = this.ctx;
+  private drawSun(ctx: Ctx2D, p: Point, b: number): void {
     ctx.save();
     const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 26);
     g.addColorStop(0, `rgba(255,210,120,${0.9 * b})`);
@@ -730,8 +982,7 @@ export class Renderer {
     ctx.restore();
   }
 
-  private drawMoon(p: Point, illum: number, waning: boolean, b: number): void {
-    const ctx = this.ctx;
+  private drawMoon(ctx: Ctx2D, p: Point, illum: number, waning: boolean, b: number): void {
     const r = 8;
     ctx.save();
     // Soft glow.
@@ -760,9 +1011,8 @@ export class Renderer {
     ctx.restore();
   }
 
-  private skyLabel(p: Point, text: string, cfg: Config, alpha: number, color = "#AEB6C6"): void {
-    const ctx = this.ctx;
-    this.withLabelRotation(cfg, p.x, p.y, () => {
+  private skyLabel(ctx: Ctx2D, p: Point, text: string, cfg: Config, alpha: number, color = "#AEB6C6"): void {
+    this.withLabelRotation(ctx, cfg, p.x, p.y, () => {
       ctx.save();
       ctx.font = `300 10px ${cfg.fonts.label}`;
       ctx.fillStyle = color;
@@ -858,6 +1108,7 @@ export class Renderer {
     pts.push({ p: v.p, age: 0 });
     if (pts.length < 2) return;
 
+    const margin = 60;
     ctx.save();
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -865,7 +1116,18 @@ export class Renderer {
       const a = pts[i - 1];
       const b = pts[i];
       const f = 1 - b.age; // 1 at head, 0 at tail
-      ctx.strokeStyle = rgba(v.color, 0.55 * f * v.alpha);
+      const alpha = 0.55 * f * v.alpha;
+      if (alpha < 0.015) continue; // tail end is invisible anyway
+      // Skip segments entirely outside the viewport.
+      if (
+        (a.p.x < -margin && b.p.x < -margin) ||
+        (a.p.x > this.w + margin && b.p.x > this.w + margin) ||
+        (a.p.y < -margin && b.p.y < -margin) ||
+        (a.p.y > this.h + margin && b.p.y > this.h + margin)
+      ) {
+        continue;
+      }
+      ctx.strokeStyle = rgba(v.color, alpha);
       ctx.lineWidth = 0.7 + 2.2 * f * (cfg.glyphSizePx / 14);
       ctx.beginPath();
       ctx.moveTo(a.p.x, a.p.y);
@@ -875,27 +1137,59 @@ export class Renderer {
     ctx.restore();
   }
 
-  // --- glyph: type-aware luminous silhouette ---
+  // --- glyph: type-aware luminous silhouette, sprite-cached body ---
+
+  /**
+   * Pre-rendered halo + body for a (kind, color, size) combination. The
+   * shadowBlur bloom is baked in, so the per-frame cost is one drawImage.
+   */
+  private glyphSprite(
+    kind: ReturnType<typeof classifyGlyph>,
+    sBase: number,
+    color: [number, number, number],
+    colorKey: string,
+  ): HTMLCanvasElement {
+    const key = `${kind}|${colorKey}|${Math.round(sBase * 2)}`;
+    let sprite = this.spriteCache.get(key);
+    if (!sprite) {
+      if (this.spriteCache.size > 128) this.spriteCache.clear();
+      sprite = document.createElement("canvas");
+      // Halo reaches 1.7s; rotor/blur padding on top of that.
+      const half = sBase * 1.8 + sBase * 0.7 * 2;
+      const dim = Math.max(2, Math.ceil(half * 2 * this.dpr));
+      sprite.width = dim;
+      sprite.height = dim;
+      const g = sprite.getContext("2d")!;
+      g.setTransform(this.dpr, 0, 0, this.dpr, dim / 2, dim / 2);
+      // Soft halo — restrained so the silhouette reads as an aircraft.
+      const halo = g.createRadialGradient(0, 0, 0, 0, 0, sBase * 1.7);
+      halo.addColorStop(0, rgba(color, 0.16));
+      halo.addColorStop(1, rgba(color, 0));
+      g.fillStyle = halo;
+      g.beginPath();
+      g.arc(0, 0, sBase * 1.7, 0, Math.PI * 2);
+      g.fill();
+      drawGlyphBody(g, kind, sBase, color, 1);
+      this.spriteCache.set(key, sprite);
+    }
+    return sprite;
+  }
+
   private drawGlyph(cfg: Config, v: Visible): void {
     const ctx = this.ctx;
-    const color = v.emergency ? hexToRgb(cfg.palette.warn) : v.color;
     const kind = classifyGlyph(v.tr.ac);
-    const s = cfg.glyphSizePx * GLYPH_SCALE[kind] * v.sizeScale;
+    const sBase = cfg.glyphSizePx * GLYPH_SCALE[kind];
+    const s = sBase * v.sizeScale;
+    const sprite = this.glyphSprite(kind, sBase, v.color, v.colorKey);
+    const dim = (sprite.width / this.dpr) * v.sizeScale;
 
     ctx.save();
     ctx.translate(v.p.x, v.p.y);
     ctx.rotate(v.heading + Math.PI / 2);
-
-    // Soft halo — restrained so the silhouette reads as an aircraft.
-    const halo = ctx.createRadialGradient(0, 0, 0, 0, 0, s * 1.7);
-    halo.addColorStop(0, rgba(color, 0.16 * v.alpha));
-    halo.addColorStop(1, rgba(color, 0));
-    ctx.fillStyle = halo;
-    ctx.beginPath();
-    ctx.arc(0, 0, s * 1.7, 0, Math.PI * 2);
-    ctx.fill();
-
-    drawAircraftGlyph(ctx, kind, s, color, v.alpha, this.frameT, hexSeed(v.tr.ac.hex));
+    ctx.globalAlpha = clamp01(v.alpha);
+    ctx.drawImage(sprite, -dim / 2, -dim / 2, dim, dim);
+    ctx.globalAlpha = 1;
+    drawGlyphProps(ctx, kind, s, v.color, v.alpha, this.frameT, hexSeed(v.tr.ac.hex));
     ctx.restore();
   }
 
@@ -917,26 +1211,41 @@ export class Renderer {
     }
   }
 
+  /** measureText is surprisingly hot — memoize by font + spacing + text. */
+  private textWidth(font: string, spacing: string, text: string): number {
+    const key = font + "|" + spacing + "|" + text;
+    let w = this.textWidthCache.get(key);
+    if (w == null) {
+      if (this.textWidthCache.size > 1000) this.textWidthCache.clear();
+      const ctx = this.ctx;
+      ctx.font = font;
+      try {
+        ctx.letterSpacing = spacing;
+      } catch {
+        /* noop */
+      }
+      w = ctx.measureText(text).width;
+      try {
+        ctx.letterSpacing = "0px";
+      } catch {
+        /* noop */
+      }
+      this.textWidthCache.set(key, w);
+    }
+    return w;
+  }
+
   private measureLabel(
     cfg: Config,
     lines: { text: string; kind: "title" | "sub" }[],
   ): { w: number; lh: number; h: number } {
-    const ctx = this.ctx;
     const lh = 16;
     let w = 0;
     for (const ln of lines) {
-      ctx.font = ln.kind === "title" ? `500 14px ${cfg.fonts.label}` : `400 11px ${cfg.fonts.label}`;
-      try {
-        ctx.letterSpacing = ln.kind === "title" ? "1.5px" : "0.5px";
-      } catch {
-        /* noop */
-      }
-      w = Math.max(w, ctx.measureText(ln.text).width);
-    }
-    try {
-      ctx.letterSpacing = "0px";
-    } catch {
-      /* noop */
+      const font =
+        ln.kind === "title" ? `500 14px ${cfg.fonts.label}` : `400 11px ${cfg.fonts.label}`;
+      const spacing = ln.kind === "title" ? "1.5px" : "0.5px";
+      w = Math.max(w, this.textWidth(font, spacing, ln.text));
     }
     return { w: w + 2, lh, h: lines.length * lh };
   }
@@ -1029,7 +1338,7 @@ export class Renderer {
     // Hairline leader from glyph to the nearest edge of the label.
     const anchorX = box.x + w / 2 < v.p.x ? box.x + w : box.x;
     const anchorY = Math.max(box.y, Math.min(v.p.y, box.y + h));
-    this.withLabelRotation(cfg, v.p.x, v.p.y, () => {
+    this.withLabelRotation(ctx, cfg, v.p.x, v.p.y, () => {
       ctx.save();
       ctx.strokeStyle = rgba(hexToRgb(cfg.palette.text), 0.24 * a);
       ctx.lineWidth = 1;
@@ -1042,7 +1351,7 @@ export class Renderer {
       ctx.textBaseline = "top";
       ctx.shadowColor = "rgba(0,0,0,0.9)";
       ctx.shadowBlur = 6;
-      let y = box.y;
+      let y = box!.y;
       for (const ln of lines) {
         if (ln.kind === "title") {
           ctx.font = `500 14px ${cfg.fonts.label}`;
@@ -1061,7 +1370,7 @@ export class Renderer {
             /* noop */
           }
         }
-        ctx.fillText(ln.text, box.x, y);
+        ctx.fillText(ln.text, box!.x, y);
         y += lh;
       }
       try {
@@ -1077,7 +1386,7 @@ export class Renderer {
     const ac = v.tr.ac;
     const x = 40;
     const y = this.h - 120;
-    this.withLabelRotation(cfg, x, y, () => this.drawDetailPanelText(cfg, v, ac, x, y));
+    this.withLabelRotation(this.ctx, cfg, x, y, () => this.drawDetailPanelText(cfg, v, ac, x, y));
   }
 
   private drawDetailPanelText(cfg: Config, v: Visible, ac: Aircraft, x: number, y: number): void {
@@ -1187,7 +1496,7 @@ function crossTrackMiles(
  *      departed the local airport (so that should be the origin); a descending
  *      one is arriving (the destination).
  */
-function routePlausible(ac: Aircraft, cfg: Config): boolean {
+export function routePlausible(ac: Aircraft, cfg: Config): boolean {
   if (ac.lat == null || ac.lon == null) return true;
   const haveCoords = ac.originLat != null || ac.destLat != null;
   if (!haveCoords) return true; // legacy cache without coords — don't hide
@@ -1223,8 +1532,13 @@ function routePlausible(ac: Aircraft, cfg: Config): boolean {
 }
 
 function hexToRgb(hex: string): [number, number, number] {
+  const cached = HEX_CACHE.get(hex);
+  if (cached) return cached;
   const m = hex.replace("#", "");
   const n = m.length === 3 ? m.split("").map((c) => c + c).join("") : m;
   const int = parseInt(n, 16);
-  return [(int >> 16) & 255, (int >> 8) & 255, int & 255];
+  const rgb: [number, number, number] = [(int >> 16) & 255, (int >> 8) & 255, int & 255];
+  HEX_CACHE.set(hex, rgb);
+  return rgb;
 }
+const HEX_CACHE = new Map<string, [number, number, number]>();
